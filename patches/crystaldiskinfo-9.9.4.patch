@@ -1,0 +1,446 @@
+diff --git a/AtaSmart.cpp b/AtaSmart.cpp
+index 4b7dbcd..260eaff 100644
+--- a/AtaSmart.cpp
++++ b/AtaSmart.cpp
+@@ -92,6 +92,30 @@ DWORD CAtaSmart::UpdateSmartInfo(DWORD i)
+ 		return SMART_STATUS_NO_CHANGE;
+ 	}
+ 
++	ATA_SMART_INFO& disk = vars[i];
++	if (disk.CommandType == CMD_TYPE_SANDISK_55DD)
++	{
++		SanDisk55DD::Readings readings;
++		const HANDLE handle = GetIoCtrlHandle(disk.PhysicalDriveId);
++		if (handle != INVALID_HANDLE_VALUE)
++		{
++			const bool matched = SanDisk55DD::Read(handle, readings);
++			::CloseHandle(handle);
++			if (!matched || disk.SerialNumber != CString(readings.Serial).Trim())
++			{
++				readings = {};
++			}
++		}
++		const CString internalFirmware(readings.InternalFirmware);
++		const bool changed = disk.HostReads != readings.HostReads || disk.Temperature != readings.Temperature
++			|| disk.SanDiskSensors != readings.Sensors || disk.SanDiskInternalFirmware != internalFirmware;
++		disk.HostReads = readings.HostReads;
++		disk.Temperature = readings.Temperature;
++		disk.SanDiskSensors = readings.Sensors;
++		disk.SanDiskInternalFirmware = internalFirmware;
++		return changed ? SMART_STATUS_MAJOR_CHANGE : SMART_STATUS_NO_CHANGE;
++	}
++
+ 	static SMART_ATTRIBUTE attribute[MAX_DISK][MAX_ATTRIBUTE] = {0};
+ 	for (int j = 0; j < 8; j++)
+ 	{
+@@ -2457,7 +2481,7 @@ VOID CAtaSmart::Init(BOOL useWmi, BOOL advancedDiskSearch, PBOOL flagChangeDisk,
+ 		{
+ 			for(int i = count - 1; i >= 0; i--)
+ 			{
+-				if(vars[i].AttributeCount == 0)
++				if(vars[i].AttributeCount == 0 && vars[i].CommandType != CMD_TYPE_SANDISK_55DD)
+ 				{
+ 					vars.RemoveAt(i);
+ 				}
+@@ -6425,6 +6449,65 @@ VOID CAtaSmart::WakeUp(INT physicalDriveId)
+ 	}
+ }
+ 
++BOOL CAtaSmart::AddSanDisk55DD(INT physicalDriveId, INT scsiPort, INT scsiTargetId, INT scsiBus, const CString& pnpDeviceId)
++{
++	const HANDLE handle = GetIoCtrlHandle(physicalDriveId);
++	if (handle == INVALID_HANDLE_VALUE)
++	{
++		return FALSE;
++	}
++
++	SanDisk55DD::Readings readings;
++	GET_LENGTH_INFORMATION length{};
++	DWORD returned = 0;
++	const bool found = SanDisk55DD::Read(handle, readings)
++		&& ::DeviceIoControl(handle, IOCTL_DISK_GET_LENGTH_INFO, nullptr, 0, &length, sizeof(length), &returned, nullptr)
++		&& returned >= sizeof(length) && length.Length.QuadPart > 0;
++	if (!found)
++	{
++		::CloseHandle(handle);
++		return FALSE;
++	}
++
++	ATA_SMART_INFO disk{};
++	disk.SanDiskCapabilities = SanDisk55DD::ReadCapabilities(handle);
++	::CloseHandle(handle);
++	disk.PhysicalDriveId = physicalDriveId;
++	disk.ScsiPort = scsiPort;
++	disk.ScsiTargetId = scsiTargetId;
++	disk.ScsiBus = scsiBus;
++	disk.PnpDeviceId = pnpDeviceId;
++	disk.Model = L"SanDisk Extreme 55DD";
++	disk.SerialNumber = readings.Serial;
++	disk.SerialNumber.Trim();
++	disk.ModelSerial = GetModelSerial(disk.Model, disk.SerialNumber);
++	disk.FirmwareRev = L"0010";
++	disk.Interface = L"SCSI";
++	disk.InterfaceType = INTERFACE_TYPE_USB;
++	disk.CommandType = CMD_TYPE_SANDISK_55DD;
++	disk.CommandTypeString = commandTypeString[CMD_TYPE_SANDISK_55DD];
++	disk.TotalDiskSize = static_cast<DWORD>(length.Length.QuadPart / 1000000);
++	disk.IsSsd = TRUE;
++	disk.NominalMediaRotationRate = 1;
++	disk.HostReads = readings.HostReads;
++	disk.Temperature = readings.Temperature;
++	disk.SanDiskSensors = readings.Sensors;
++	disk.SanDiskInternalFirmware = readings.InternalFirmware;
++	disk.LogicalSectorSize = disk.SanDiskCapabilities.LogicalSector;
++	disk.PhysicalSectorSize = disk.SanDiskCapabilities.PhysicalSector;
++	disk.IsTrimSupported = disk.SanDiskCapabilities.Trim == 1;
++	disk.DiskStatus = DISK_STATUS_UNKNOWN;
++	disk.Life = -1;
++	disk.HostWrites = -1;
++	disk.NandWrites = -1;
++	disk.GBytesErased = -1;
++	disk.WearLevelingCount = -1;
++	disk.DetectedPowerOnHours = -1;
++	disk.MeasuredPowerOnHours = -1;
++	vars.Add(disk);
++	return TRUE;
++}
++
+ BOOL CAtaSmart::GetDiskInfo(INT physicalDriveId, INT scsiPort, INT scsiTargetId,
+ 	INTERFACE_TYPE interfaceType, COMMAND_TYPE commandType, VENDOR_ID usbVendorId, DWORD productId, INT scsiBus, DWORD siliconImageType, BOOL FlagNvidiaController, BOOL FlagMarvellController, CString pnpDeviceId,
+ 	BOOL flagNVMe, BOOL flagUsap
+@@ -6456,6 +6539,16 @@ BOOL CAtaSmart::GetDiskInfo(INT physicalDriveId, INT scsiPort, INT scsiTargetId,
+ 		*/
+ 	}
+ 
++	const TCHAR sandiskUasp[] = _T("SCSI\\DISK&VEN_SANDISK&PROD_EXTREME_55DD\\");
++	const TCHAR sandiskUsb[] = _T("USBSTOR\\DISK&VEN_SANDISK&PROD_EXTREME_55DD&");
++	const bool sandisk55dd = _tcsnicmp(pnpDeviceId.GetString(), sandiskUasp, _countof(sandiskUasp) - 1) == 0
++		|| _tcsnicmp(pnpDeviceId.GetString(), sandiskUsb, _countof(sandiskUsb) - 1) == 0;
++	if (physicalDriveId >= 0 && vars.GetCount() < MAX_DISK && sandisk55dd
++		&& AddSanDisk55DD(physicalDriveId, scsiPort, scsiTargetId, scsiBus, pnpDeviceId))
++	{
++		return TRUE;
++	}
++
+ 	IDENTIFY_DEVICE identify = {};
+ 	DWORD diskSize = 0;
+ 
+diff --git a/AtaSmart.h b/AtaSmart.h
+index 6898d65..3f5bf42 100644
+--- a/AtaSmart.h
++++ b/AtaSmart.h
+@@ -10,6 +10,7 @@
+ 
+ #include "winioctl.h"
+ #include "SPTIUtil.h"
++#include "SanDisk55DD.h"
+ #include "SlotSpeedGetter.h"
+ #include "NVMeInterpreter.h"
+ #include "StorageQuery.h"
+@@ -55,6 +56,7 @@ static const TCHAR* commandTypeString[] =
+ 	_T("j4"), // JMS586_40
+ 	_T("j9"), // JMS59X
+ 	_T("dg"), // Debug
++	_T("sd"), // SanDisk 55DD
+ };
+ 
+ static const TCHAR* ssdVendorString[] =
+@@ -371,7 +373,8 @@ public:
+ 		CMD_TYPE_JMS586_20,
+ 		CMD_TYPE_JMS586_40,
+ 		CMD_TYPE_JMS59X,
+-		CMD_TYPE_DEBUG
++		CMD_TYPE_DEBUG,
++		CMD_TYPE_SANDISK_55DD
+ 	};
+ 
+ 	enum CSMI_TYPE
+@@ -1861,6 +1864,9 @@ public:
+ 		DWORD				PowerOnCount{};
+ 		INT					Temperature{};
+ 		INT					TemperatureNVMe[8]{};
++		SanDisk55DD::SensorReadings SanDiskSensors = SanDisk55DD::UnknownSensors;
++		SanDisk55DD::Capabilities SanDiskCapabilities{};
++		CString				SanDiskInternalFirmware;
+ 
+ 		double				TemperatureMultiplier{};
+ 		DWORD				NominalMediaRotationRate{};
+@@ -2027,6 +2033,7 @@ protected:
+ 	VOID ChangeByteOrder(PCHAR str, DWORD length);
+ 	BOOL CheckAsciiStringError(PCHAR str, DWORD length);
+ 	HANDLE GetIoCtrlHandle(INT/*BYTE*/ index);
++	BOOL AddSanDisk55DD(INT physicalDriveId, INT scsiPort, INT scsiTargetId, INT scsiBus, const CString& pnpDeviceId);
+ 	HANDLE GetIoCtrlHandle(INT scsiPort, DWORD siliconImageType);
+ 	HANDLE GetIoCtrlHandleCsmi(INT scsiPort);
+ 	HANDLE GetIoCtrlHandleMegaRAID(INT scsiPort);
+diff --git a/DiskInfoDlg.h b/DiskInfoDlg.h
+index 5e71a98..0d13641 100644
+--- a/DiskInfoDlg.h
++++ b/DiskInfoDlg.h
+@@ -27,6 +27,7 @@
+ // #include "ImageToast.h"
+ 
+ #include <Dbt.h>
++#include <vector>
+ 
+ #define REGISTRY_PATH _T("software\\Crystal Dew World\\CrystalDiskInfo")
+ 
+@@ -296,6 +297,8 @@ protected:
+ 
+ 	BOOL ChangeDisk(DWORD index);
+ 	BOOL UpdateListCtrl(DWORD index);
++	struct SanDiskDiagnosticRow { CString Name; CString Value; CString Source; };
++	std::vector<SanDiskDiagnosticRow> GetSanDiskDiagnosticRows(DWORD index);
+ 	void SelectDrive(DWORD index);
+ 	void InitDriveList();
+ 	void InitListCtrl();
+diff --git a/DiskInfoDlgCopy.cpp b/DiskInfoDlgCopy.cpp
+index 94beef3..5c7fd85 100644
+--- a/DiskInfoDlgCopy.cpp
++++ b/DiskInfoDlgCopy.cpp
+@@ -374,7 +374,8 @@ void CDiskInfoDlg::SaveText(CString fileName)
+ 		}
+ 		else
+ 		{
+-			cstr.Format(_T("      Host Reads : %d GB\r\n"), m_Ata.vars[i].HostReads);		
++			const LPCTSTR unit = m_Ata.vars[i].CommandType == CAtaSmart::CMD_TYPE_SANDISK_55DD ? _T("GiB") : _T("GB");
++			cstr.Format(_T("      Host Reads : %d %s\r\n"), m_Ata.vars[i].HostReads, unit);
+ 			drive.Replace(_T("%HOST_READS%"), cstr);
+ 		}
+ 
+@@ -648,6 +649,15 @@ void CDiskInfoDlg::SaveText(CString fileName)
+ 
+ 		clip += drive;
+ 
++		if (m_Ata.vars[i].CommandType == CAtaSmart::CMD_TYPE_SANDISK_55DD)
++		{
++			clip += L"\r\n-- SanDisk diagnostics ------------------------------------------------------\r\n";
++			for (const auto& row : GetSanDiskDiagnosticRows(i))
++			{
++				clip += row.Name + L"\t" + row.Value + L"\t" + row.Source + L"\r\n";
++			}
++		}
++
+ 		CString vendorSpecific;
+ 		vendorSpecific = i18n(_T("Smart"), _T("VENDOR_SPECIFIC"), m_bSmartEnglish);
+ 
+@@ -1006,4 +1016,4 @@ void CDiskInfoDlg::SaveText(CString fileName)
+ void CDiskInfoDlg::OnCopy()
+ {
+ 	SaveText(_T(""));
+-}
+\ No newline at end of file
++}
+diff --git a/DiskInfoDlgInit.cpp b/DiskInfoDlgInit.cpp
+index ce997ef..2f2ccce 100644
+--- a/DiskInfoDlgInit.cpp
++++ b/DiskInfoDlgInit.cpp
+@@ -218,6 +218,15 @@ BOOL CDiskInfoDlg::OnInitDialog()
+ 	DebugPrint(_T("InitAta"));
+ 	InitAta((BOOL)GetPrivateProfileInt(_T("Setting"), _T("UseWMI"), 1, m_Ini), m_bAdvancedDiskSearch, NULL, m_bWorkaroundHD204UI, m_bWorkaroundAdataSsd);
+ 
++	for (INT_PTR i = 0; i < m_Ata.vars.GetCount(); ++i)
++	{
++		if (m_Ata.vars[i].CommandType == CAtaSmart::CMD_TYPE_SANDISK_55DD)
++		{
++			m_SelectDisk = static_cast<DWORD>(i);
++			break;
++		}
++	}
++
+ 	if(m_bStartupExit)
+ 	{
+ 		// Added 2013/04/12 - Workaround for Exec Failed
+@@ -834,7 +843,9 @@ void CDiskInfoDlg::InitDriveList()
+ 		{
+ 			CString targetDisk;
+ 			targetDisk.Format(_T("Disk%d"), i % m_DriveMenuNumber);
+-			if (m_Ata.vars[i].DiskVendorId == m_Ata.SSD_VENDOR_NVME && m_Ata.vars[i].Temperature > -300)
++			if ((m_Ata.vars[i].DiskVendorId == m_Ata.SSD_VENDOR_NVME
++				|| m_Ata.vars[i].CommandType == CAtaSmart::CMD_TYPE_SANDISK_55DD)
++				&& m_Ata.vars[i].Temperature > -300)
+ 			{
+ 				if (m_bFahrenheit)
+ 				{
+diff --git a/DiskInfoDlgUpdate.cpp b/DiskInfoDlgUpdate.cpp
+index 39f58fa..a587228 100644
+--- a/DiskInfoDlgUpdate.cpp
++++ b/DiskInfoDlgUpdate.cpp
+@@ -184,6 +184,7 @@ void CDiskInfoDlg::DeleteShareInfo()
+ void CDiskInfoDlg::RebuildListHeader(DWORD i, BOOL forceUpdate)
+ {
+ 	static DWORD preVendorId = (DWORD)-1;
++	static bool preSanDisk = false;
+ 	int width = 0;
+ 
+ 	HMODULE hModule = GetModuleHandle(L"user32.dll");
+@@ -214,13 +215,24 @@ void CDiskInfoDlg::RebuildListHeader(DWORD i, BOOL forceUpdate)
+ 	}
+ 
+ 	m_List.DeleteAllItems();
+-	if (preVendorId == m_Ata.vars[i].DiskVendorId && !forceUpdate)
++	const bool sanDisk = m_Ata.vars[i].CommandType == CAtaSmart::CMD_TYPE_SANDISK_55DD;
++	if (preSanDisk == sanDisk && preVendorId == m_Ata.vars[i].DiskVendorId && !forceUpdate)
+ 	{
+ 		return;
+ 	}
+ 
+ 	while (m_List.DeleteColumn(0)) {}
+-	if (m_Ata.vars[i].DiskVendorId == m_Ata.SSD_VENDOR_NVME)
++	preSanDisk = sanDisk;
++	if (sanDisk)
++	{
++		const int metricWidth = width * 42 / 100;
++		const int readingWidth = width * 34 / 100;
++		m_List.InsertColumn(0, L"SanDisk diagnostic", LVCFMT_LEFT, metricWidth);
++		m_List.InsertColumn(1, L"Reading", LVCFMT_LEFT, readingWidth);
++		m_List.InsertColumn(2, L"Source", LVCFMT_LEFT, width - metricWidth - readingWidth);
++		preVendorId = m_Ata.vars[i].DiskVendorId;
++	}
++	else if (m_Ata.vars[i].DiskVendorId == m_Ata.SSD_VENDOR_NVME)
+ 	{
+ 		m_List.InsertColumn(0, _T(""), LVCFMT_CENTER, 25, 0);
+ 		m_List.InsertColumn(1, i18n(_T("Dialog"), _T("LIST_ID"), m_bSmartEnglish), LVCFMT_CENTER, (int)(32 * m_ZoomRatio), 0);
+@@ -280,6 +292,66 @@ void CDiskInfoDlg::RebuildListHeader(DWORD i, BOOL forceUpdate)
+ 	m_List.EnableHeaderOwnerDraw(TRUE);
+ }
+ 
++std::vector<CDiskInfoDlg::SanDiskDiagnosticRow> CDiskInfoDlg::GetSanDiskDiagnosticRows(DWORD i)
++{
++	const auto& disk = m_Ata.vars[i];
++	const auto& caps = disk.SanDiskCapabilities;
++	const auto& sensor = disk.SanDiskSensors;
++	const CString unavailable = L"Unavailable";
++	const auto formatNumber = [&unavailable](DWORD number, LPCWSTR unit) {
++		if (number == 0)
++		{
++			return unavailable;
++		}
++		CString result;
++		result.Format(L"%lu %s", number, unit);
++		return result;
++	};
++	const auto formatTemperature = [this, &unavailable](int degrees) {
++		if (degrees == SanDisk55DD::UnknownTemperature)
++		{
++			return unavailable;
++		}
++		CString result;
++		if (m_bFahrenheit)
++		{
++			result.Format(L"%d \u00B0F", degrees * 9 / 5 + 32);
++		}
++		else
++		{
++			result.Format(L"%d \u00B0C", degrees);
++		}
++		return result;
++	};
++	const auto enabled = [&unavailable](int state) {
++		return state < 0 ? unavailable : CString(state ? L"Enabled" : L"Disabled");
++	};
++
++	CString hostReads = unavailable;
++	if (disk.HostReads >= 0)
++	{
++		hostReads.Format(L"%d GiB", disk.HostReads);
++	}
++	using namespace SanDisk55DD;
++	return {
++		{L"Lifetime host reads", hostReads, L"SanDisk log 0x30"},
++		{L"Controller temperature", formatTemperature(disk.Temperature), L"SanDisk log 0x32"},
++		{L"NAND channels 1 to 4", formatTemperature(sensor[Nand1]) + L" / " + formatTemperature(sensor[Nand2])
++			+ L" / " + formatTemperature(sensor[Nand3]) + L" / " + formatTemperature(sensor[Nand4]), L"SanDisk log 0x32"},
++		{L"Recorded minimum / maximum", formatTemperature(sensor[Minimum]) + L" / " + formatTemperature(sensor[Maximum]), L"SanDisk log 0x32"},
++		{L"Board sensors A / B", formatTemperature(sensor[BoardA]) + L" / " + formatTemperature(sensor[BoardB]), L"SanDisk log 0x32"},
++		{L"Internal firmware ID", disk.SanDiskInternalFirmware.IsEmpty() ? unavailable : disk.SanDiskInternalFirmware, L"SanDisk log 0x31"},
++		{L"Logical / physical sector size", formatNumber(caps.LogicalSector, L"B") + L" / " + formatNumber(caps.PhysicalSector, L"B"), L"Windows storage"},
++		{L"TRIM", enabled(caps.Trim), L"Windows storage"},
++		{L"Read cache / write-back cache", enabled(caps.ReadCache) + L" / " + enabled(caps.WriteCache), L"SCSI mode page 0x08"},
++		{L"Power-on hours / cycles", L"Unavailable over USB", L"Standard SMART"},
++		{L"Lifetime host / NAND writes", L"Unavailable over USB", L"Standard SMART"},
++		{L"Wear / spare capacity", L"Unavailable over USB", L"Standard SMART"},
++		{L"Media errors / self-test history", L"Unavailable over USB", L"Standard SMART"},
++		{L"Unsafe shutdowns", L"Unavailable over USB", L"Standard SMART"},
++	};
++}
++
+ BOOL CDiskInfoDlg::UpdateListCtrl(DWORD i)
+ {
+ 	static DWORD preSelectDisk = 0;
+@@ -302,6 +374,29 @@ BOOL CDiskInfoDlg::UpdateListCtrl(DWORD i)
+ 		preSelectDisk = i;
+ 	}
+ 
++	if (m_Ata.vars[i].CommandType == CAtaSmart::CMD_TYPE_SANDISK_55DD)
++	{
++		const auto rows = GetSanDiskDiagnosticRows(i);
++		const bool rebuild = !flag || m_List.GetItemCount() != static_cast<int>(rows.size());
++		if (rebuild)
++		{
++			m_List.DeleteAllItems();
++		}
++		int item = 0;
++		for (const auto& row : rows)
++		{
++			if (rebuild)
++			{
++				m_List.InsertItem(item, row.Name, I_IMAGENONE);
++			}
++			m_List.SetItemText(item, 1, row.Value);
++			m_List.SetItemText(item, 2, row.Source);
++			++item;
++		}
++		m_List.SetRedraw(TRUE);
++		return TRUE;
++	}
++
+ 	CString cstr;
+ 	DWORD caution = 0;
+ 	UINT mask = LVIF_IMAGE;
+@@ -1357,7 +1452,13 @@ BOOL CDiskInfoDlg::ChangeDisk(DWORD i)
+ 	{
+ 		cstr = L"";
+ 
+-		if(m_Ata.vars[i].HostReads > 1024 * 1024)
++		const bool sandisk = m_Ata.vars[i].CommandType == CAtaSmart::CMD_TYPE_SANDISK_55DD;
++		const LPCTSTR unit = sandisk ? _T("GiB") : _T("GB");
++		if (sandisk)
++		{
++			cstr.Format(_T("%d GiB (SanDisk diagnostic log)"), m_Ata.vars[i].HostReads);
++		}
++		else if(m_Ata.vars[i].HostReads > 1024 * 1024)
+ 		{
+ 			cstr.Format(_T("%.3f PB"), m_Ata.vars[i].HostReads / 1024.0 / 1024.0);
+ 		}
+@@ -1370,7 +1471,7 @@ BOOL CDiskInfoDlg::ChangeDisk(DWORD i)
+ 			cstr.Format(_T("%d GB"), m_Ata.vars[i].HostReads);
+ 		}
+ 
+-		m_BufferSize.Format(_T("%d GB"), m_Ata.vars[i].HostReads);
++		m_BufferSize.Format(_T("%d %s"), m_Ata.vars[i].HostReads, unit);
+ 		m_LabelBufferSize = i18n(_T("Dialog"), _T("TOTAL_HOST_READS"));
+ 		m_CtrlBufferSize.SetToolTipText(cstr + L"  ");
+ 		m_CtrlLabelBufferSize.SetToolTipText(i18n(_T("Dialog"), _T("TOTAL_HOST_READS")));
+diff --git a/Library/stdafx.h b/Library/stdafx.h
+index 3808fc6..34384f7 100644
+--- a/Library/stdafx.h
++++ b/Library/stdafx.h
+@@ -64,8 +64,8 @@
+ //------------------------------------------------
+ 
+ // Version Information
+-#define PROJECT_NAME			_T("CrystalDiskInfo")
+-#define PRODUCT_NAME			_T("CrystalDiskInfo")
++#define PROJECT_NAME			_T("CrystalDiskInfo-SanDisk")
++#define PRODUCT_NAME			_T("CrystalDiskInfo (SanDisk)")
+ #define PRODUCT_FILENAME		_T("CrystalDiskInfo")
+ 
+ #ifdef SUISHO_AOI_SUPPORT
+@@ -291,4 +291,4 @@ static const int ALARM_SETTING_HEALTH_STATUS_BASE = WM_APP + 0x1900;
+ static const int ALARM_SETTING_TEMPERATURE_BASE = WM_APP + 0x2000; // Main Only
+ static const int GRAPH_DISK_INDEX = WM_APP + 0x2000; // Graph Only
+ 
+-static const int RE_EXEC = 5963;
+\ No newline at end of file
++static const int RE_EXEC = 5963;

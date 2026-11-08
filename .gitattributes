@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# Preserve the upstream line endings in the integration patch.
+patches/*.patch -text -whitespace
